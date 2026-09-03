@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app.core.database import create_public_tables
-from app.models import tenant  # noqa: F401 — registers model with SQLAlchemy
+from app.models import tenant  # noqa: F401
+from app.models import user    # noqa: F401
 from app.api.routes import api_router
 
 
