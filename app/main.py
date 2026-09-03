@@ -1,10 +1,8 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app.core.database import create_public_tables
-
-# This import is REQUIRED — it registers the Tenant model with SQLAlchemy
-# Without this, create_all() doesn't know the tenants table should exist
-from app.models import tenant  # noqa: F401
+from app.models import tenant  # noqa: F401 — registers model with SQLAlchemy
+from app.api.routes import api_router
 
 
 @asynccontextmanager
@@ -22,6 +20,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(api_router)
 
 
 @app.get("/health")
