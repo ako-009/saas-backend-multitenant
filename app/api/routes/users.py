@@ -23,15 +23,8 @@ class UpdateRoleRequest(BaseModel):
 async def get_users(
     current_user: TokenData = Depends(require_permission("users:list"))
 ):
-    """
-    List all users in the current tenant.
-    Accessible by: Admin, Manager
-    
-    Notice: we get tenant_id from the JWT — no URL parameter needed.
-    The token tells us exactly which schema to query.
-    """
     async for db in get_tenant_db(current_user.tenant_id):
-        return await list_users(db)
+        return await list_users(current_user.tenant_id, db)
 
 
 @router.post("/invite", response_model=UserResponse, status_code=201)
@@ -39,15 +32,12 @@ async def invite_new_user(
     payload: InviteUserRequest,
     current_user: TokenData = Depends(require_permission("users:invite"))
 ):
-    """
-    Invite a new user to this tenant.
-    Accessible by: Admin only
-    """
     async for db in get_tenant_db(current_user.tenant_id):
         return await invite_user(
             email=payload.email,
             role=payload.role.value,
             invited_by=current_user.user_id,
+            tenant_id=current_user.tenant_id,
             db=db
         )
 
@@ -58,14 +48,11 @@ async def change_user_role(
     payload: UpdateRoleRequest,
     current_user: TokenData = Depends(require_permission("users:update_role"))
 ):
-    """
-    Change a user's role.
-    Accessible by: Admin only
-    """
     async for db in get_tenant_db(current_user.tenant_id):
         return await update_user_role(
             user_id=str(user_id),
             new_role=payload.role.value,
+            tenant_id=current_user.tenant_id,
             db=db
         )
 
@@ -75,22 +62,14 @@ async def remove_user(
     user_id: uuid.UUID,
     current_user: TokenData = Depends(require_permission("users:delete"))
 ):
-    """
-    Deactivate a user.
-    Accessible by: Admin only
-    """
     async for db in get_tenant_db(current_user.tenant_id):
-        return await delete_user(str(user_id), db)
+        return await delete_user(str(user_id), current_user.tenant_id, db)
 
 
 @router.get("/me", response_model=UserResponse)
 async def get_my_profile(
     current_user: TokenData = Depends(get_current_user)
 ):
-    """
-    Get current user's own profile.
-    Accessible by: All authenticated users
-    """
     async for db in get_tenant_db(current_user.tenant_id):
         from sqlalchemy import select
         from app.models.user import User
