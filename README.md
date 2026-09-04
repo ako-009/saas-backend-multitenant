@@ -1,4 +1,3 @@
-# saas-backend-multitenant
 # 🏢 Scalable Multi-Tenant B2B SaaS Backend
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue?style=flat-square&logo=python)
@@ -48,14 +47,14 @@ This backend solves all four using PostgreSQL schema-based isolation, JWT-RBAC, 
                        ▼                   ▼
               ┌──────────────┐    ┌──────────────┐
               │  PostgreSQL  │    │    AWS S3    │
-              │Schema-per-   │    │Per-Tenant    │
-              │  Tenant      │    │  Buckets     │
+              │Schema-per-   │    │  Pre-signed  │
+              │  Tenant      │    │    URLs      │
               └──────┬───────┘    └──────────────┘
                      │
                      ▼
               ┌──────────────┐
               │    Redis     │
-              │Query Cache   │
+              │  Cache-aside │
               └──────────────┘
 ```
 
@@ -68,7 +67,7 @@ This backend solves all four using PostgreSQL schema-based isolation, JWT-RBAC, 
 | Tenant Isolation | PostgreSQL schema-per-tenant | Zero cross-tenant data leakage |
 | Role-Based Access | JWT + RBAC middleware | Admin/Manager/User permission tiers |
 | File Storage | AWS S3 + pre-signed URLs | Secure per-tenant document management |
-| Performance | Redis query caching | ~60% API latency reduction under load |
+| Performance | Redis cache-aside pattern | 97% API latency reduction |
 | Onboarding | Automated schema provisioning | New tenant live in < 2 seconds |
 | Scalability | Stateless API + Docker | Horizontal scaling ready |
 
@@ -80,67 +79,130 @@ This system uses **Schema-Based Isolation** — the most secure multi-tenancy pa
 
 ```
 PostgreSQL Instance
-├── public schema          (shared: tenant registry, auth)
-├── tenant_acme schema     (Acme Corp's isolated data)
-├── tenant_techco schema   (TechCo's isolated data)
-└── tenant_startup schema  (Startup's isolated data)
+├── public schema          (shared: tenant registry)
+├── tenant_acme_corp       (Acme Corp's isolated data)
+├── tenant_techco          (TechCo's isolated data)
+└── tenant_startup         (Startup's isolated data)
 ```
 
-**Why schema-based over row-level?**
+**Why schema-based over row-level isolation?**
 - No risk of missing `WHERE tenant_id =` in queries
-- PostgreSQL search_path ensures automatic isolation
-- Independent backup and restore per tenant
-- No index bloat from tenant_id columns
+- PostgreSQL `search_path` enforces automatic isolation at DB level
+- Cross-tenant access is structurally impossible
+- Independent schema per tenant — clean separation
+
+**Schema Provisioning Flow:**
+```
+POST /tenants/register
+    → validate + generate slug
+    → INSERT into public.tenants
+    → CREATE SCHEMA tenant_{slug}
+    → CREATE TABLE users, documents, settings
+    → COMMIT (atomic transaction)
+    → Done in ~127ms
+```
 
 ---
 
-## 🔑 RBAC Permission Matrix
+## 🔑 JWT Token Structure
 
-| Action | Admin | Manager | User |
+Every request carries tenant context and role inside the JWT — no extra DB lookup needed:
+
+```json
+{
+  "sub": "139ab52d-44aa-4ff8-a443-892dfcba23a0",
+  "tenant_id": "acme_corp",
+  "role": "admin",
+  "exp": 1788463702,
+  "iat": 1788461902
+}
+```
+
+---
+
+## 🛡️ RBAC Permission Matrix
+
+| Permission | Admin | Manager | User |
 |---|---|---|---|
-| Create/Delete Tenant Users | ✅ | ❌ | ❌ |
-| Manage Billing | ✅ | ❌ | ❌ |
-| Upload/Delete Documents | ✅ | ✅ | ❌ |
-| View Analytics Dashboard | ✅ | ✅ | ❌ |
-| Read Own Data | ✅ | ✅ | ✅ |
-| Update Profile | ✅ | ✅ | ✅ |
+| users:list | ✅ | ✅ | ❌ |
+| users:invite | ✅ | ❌ | ❌ |
+| users:delete | ✅ | ❌ | ❌ |
+| users:update_role | ✅ | ❌ | ❌ |
+| documents:upload | ✅ | ✅ | ❌ |
+| documents:delete | ✅ | ❌ | ❌ |
+| documents:list | ✅ | ✅ | ✅ |
+| settings:read | ✅ | ✅ | ❌ |
+| settings:update | ✅ | ❌ | ❌ |
+| profile:read | ✅ | ✅ | ✅ |
+
+---
+
+## ☁️ AWS S3 Pre-signed URL Flow
+
+```
+1. Client → POST /documents/upload-url
+2. API    → generates pre-signed S3 URL (15 min expiry)
+3. Client → uploads directly to S3 (API server never touches file)
+4. Client → POST /documents/confirm (save metadata to DB)
+
+S3 Key Structure: {tenant_slug}/{user_id}/{uuid}/{filename}
+Example: acme_corp/139ab52d.../a1b2c3.../report.pdf
+```
+
+API server never handles file bytes → zero file handling load.
+
+---
+
+## ⚡ Redis Caching Strategy
+
+Cache-aside pattern with tenant-namespaced keys:
+
+```
+Key format: tenant:{tenant_id}:{resource}
+Example:    tenant:acme_corp:users
+
+Flow:
+1. Check Redis → HIT → return in ~7ms
+2. MISS → query PostgreSQL → store in Redis (TTL: 60s) → return
+3. On any write → invalidate cache key immediately
+```
 
 ---
 
 ## 📁 Project Structure
 
 ```
-saas-backend/
+saas-backend-multitenant/
 ├── app/
 │   ├── api/
 │   │   ├── routes/
-│   │   │   ├── auth.py            # Login, register, token refresh
-│   │   │   ├── tenants.py         # Tenant CRUD + onboarding
-│   │   │   ├── users.py           # User management per tenant
+│   │   │   ├── auth.py            # Login, register
+│   │   │   ├── tenants.py         # Tenant registration
+│   │   │   ├── users.py           # User management
 │   │   │   └── documents.py       # S3 document management
 │   │   └── middleware/
-│   │       ├── tenant_resolver.py # Extract tenant from JWT
-│   │       └── rbac.py            # Permission enforcement
+│   │       └── rbac.py            # JWT decode + permission enforcement
 │   ├── core/
 │   │   ├── config.py              # Environment settings
-│   │   ├── security.py            # JWT creation + validation
-│   │   └── database.py            # Dynamic schema connection
+│   │   ├── security.py            # JWT + bcrypt
+│   │   └── database.py            # Dynamic schema switching
 │   ├── models/
-│   │   ├── tenant.py              # Tenant model
-│   │   ├── user.py                # User model
+│   │   ├── tenant.py              # Tenant model (public schema)
+│   │   ├── user.py                # User model (tenant schema)
 │   │   └── document.py            # Document metadata model
 │   ├── services/
 │   │   ├── tenant_service.py      # Schema provisioning
 │   │   ├── auth_service.py        # Authentication logic
-│   │   ├── document_service.py    # S3 operations
-│   │   └── cache_service.py       # Redis caching
+│   │   ├── user_service.py        # User operations + cache
+│   │   ├── document_service.py    # S3 pre-signed URL generation
+│   │   └── cache_service.py       # Redis cache-aside
+│   ├── storage/
+│   │   └── s3_client.py           # boto3 S3 client
 │   └── main.py
-├── migrations/
-│   └── alembic/
 ├── tests/
-│   ├── unit/
-│   ├── integration/
 │   └── load/
+│       └── locustfile.py          # Locust load test
+├── benchmark.py                   # Redis latency benchmark
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
@@ -149,16 +211,51 @@ saas-backend/
 
 ---
 
-## 📊 Performance Benchmarks
+## 📊 Actual Benchmark Results
 
-| Metric | Result | Test Condition |
-|---|---|---|
-| API Latency (cached) | < 15ms | Redis cache hit |
-| API Latency (uncached) | < 40ms | Direct DB query |
-| Latency Reduction | ~60% | After Redis caching under load |
-| Tenant Onboarding | < 2 seconds | Schema provisioning time |
-| Concurrent Tenants | 500+ | Load tested |
-| Zero Cross-Tenant Leakage | ✅ | Penetration tested |
+**Redis Cache Benchmark**
+```
+Request  1 (cache MISS): 275ms  ← PostgreSQL query
+Request  2 (cache HIT):   10ms  ← Redis
+Request  3+:               7ms  ← Redis
+
+Latency reduction: 97% (CV target was 60%)
+```
+
+**Locust Load Test (50 concurrent users, 30 seconds)**
+```
+GET /users/      → 334 requests | 10ms median | 0 failures
+GET /users/me    → 264 requests | 11ms median | 0 failures
+GET /documents/  → 143 requests | 11ms median | 0 failures
+Total            → 892 requests | 0 failures  | 30 req/s
+```
+
+**Tenant Schema Provisioning**
+```
+POST /tenants/register → schema provisioned in ~127ms
+Tables created: users, documents, settings
+Target was < 2000ms — achieved in 127ms
+```
+
+---
+
+## 🔌 API Endpoints
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/tenants/register` | Public | Register tenant + provision schema |
+| GET | `/tenants/{id}` | Admin | Get tenant details |
+| POST | `/auth/register/{slug}` | Public | Register user for tenant |
+| POST | `/auth/login/{slug}` | Public | Login → JWT token |
+| GET | `/users/` | Admin/Manager | List tenant users |
+| POST | `/users/invite` | Admin | Invite new user |
+| PUT | `/users/{id}/role` | Admin | Update user role |
+| DELETE | `/users/{id}` | Admin | Deactivate user |
+| GET | `/users/me` | All | Own profile |
+| POST | `/documents/upload-url` | Admin/Manager | Get S3 pre-signed URL |
+| POST | `/documents/confirm` | Admin/Manager | Save document metadata |
+| GET | `/documents/` | All | List tenant documents |
+| DELETE | `/documents/{id}` | Admin | Delete document |
 
 ---
 
@@ -166,52 +263,88 @@ saas-backend/
 
 ```bash
 # Clone
-git clone https://github.com/ako-009/saas-backend.git
-cd saas-backend
+git clone https://github.com/ako-009/saas-backend-multitenant.git
+cd saas-backend-multitenant
 
-# Start services
-docker-compose up -d
+# Environment
+cp .env.example .env
 
-# Run migrations
-docker-compose exec app alembic upgrade head
+# Start services (PostgreSQL + Redis + MinIO)
+docker compose up postgres redis minio -d
 
-# Create first tenant
-curl -X POST "http://localhost:8000/tenants/register" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Acme Corp", "admin_email": "admin@acme.com"}'
+# Install dependencies
+python -m venv venv
+venv\Scripts\activate        # Windows
+pip install -r requirements.txt
+
+# Run
+uvicorn app.main:app --reload --port 8000
 ```
 
----
-
-## 🔌 API Endpoints
-
-| Method | Endpoint | Role Required | Description |
-|---|---|---|---|
-| POST | `/auth/login` | Public | Get JWT token |
-| POST | `/tenants/register` | Public | Register new tenant |
-| GET | `/users/` | Admin | List tenant users |
-| POST | `/users/invite` | Admin | Invite new user |
-| POST | `/documents/upload` | Admin/Manager | Get S3 upload URL |
-| GET | `/documents/` | All | List tenant documents |
+Open `http://localhost:8000/docs` for Swagger UI.
 
 ---
 
 ## 🎯 Design Decisions
 
-### Schema-per-tenant vs Row-level security
-Schema isolation was chosen because it provides stronger guarantees — a misconfigured query cannot accidentally leak cross-tenant data, unlike row-level security which relies on every query including `WHERE tenant_id = ?`.
+**Schema-per-tenant vs Row-level security**
+Schema isolation was chosen because cross-tenant access is structurally impossible — the database itself enforces it. Row-level security relies on every query having the correct WHERE clause, which is a single developer mistake away from a data breach.
 
-### Pre-signed URLs for S3
-Instead of proxying file uploads through the API server, clients upload directly to S3 using time-limited pre-signed URLs. This reduces server load, improves upload speed and keeps files off the application server entirely.
+**Pre-signed URLs for S3**
+Clients upload directly to S3 using time-limited pre-signed URLs. The API server never handles file bytes — eliminating file handling load, memory pressure, and bandwidth costs entirely.
 
-### Redis caching strategy
-Cache-aside pattern: read from Redis first, fall back to PostgreSQL on miss, write back to Redis. TTL set to 5 minutes for user/role data — short enough to reflect permission changes, long enough to reduce DB load significantly.
+**Redis cache-aside**
+Cache keys are namespaced by tenant_id (`tenant:acme_corp:users`) — mirroring database schema isolation at the cache layer. TTL of 60 seconds with explicit invalidation on writes ensures consistency.
+
+**JWT with embedded tenant context**
+Embedding `tenant_id` and `role` in the JWT payload means every request is self-contained. Middleware resolves both tenant context and RBAC permissions with a single token decode — no extra DB round trip.
+
+---
+
+## 🎓 Interview Q&A
+
+**Q: What is multi-tenancy? What are the three models?**
+Shared tables with tenant_id column (row-level), separate schema per tenant (schema-level), or separate database per tenant. Schema-per-tenant balances isolation and operational simplicity.
+
+**Q: Why schema-per-tenant over row-level isolation?**
+A missing WHERE clause in row-level isolation leaks all tenant data. Schema isolation makes that structurally impossible — wrong schema means no data, not wrong data.
+
+**Q: How does your RBAC system work?**
+JWT contains the user's role. `require_permission("users:invite")` is a FastAPI dependency factory that checks the permission matrix. No DB lookup — the token carries everything needed.
+
+**Q: What is a pre-signed URL?**
+A time-limited S3 URL cryptographically signed with AWS credentials. Anyone with the URL can upload exactly one file to exactly one location for exactly 15 minutes. After expiry, the URL is useless.
+
+**Q: What did you cache in Redis?**
+User lists — read-heavy, change rarely. Keys namespaced by tenant (`tenant:acme_corp:users`). TTL 60 seconds with explicit invalidation on any write operation.
+
+**Q: What happens if schema provisioning fails midway?**
+Everything runs in a single atomic transaction. If CREATE TABLE documents fails after CREATE TABLE users succeeded, the entire transaction rolls back — no partially provisioned tenants.
+
+**Q: How would you scale this to 10,000 tenants?**
+Connection pooling with PgBouncer, read replicas for each tenant group, Redis Cluster for cache, S3 lifecycle policies for document archival, and horizontal API scaling behind a load balancer.
+
+---
+
+## 🛠️ Tech Stack
+
+| Component | Technology | Version |
+|---|---|---|
+| Framework | FastAPI | 0.110.0 |
+| Database | PostgreSQL | 15 |
+| Cache | Redis | 7.2 |
+| Storage | AWS S3 / MinIO | - |
+| Auth | JWT + bcrypt | - |
+| ORM | SQLAlchemy (async) | 2.0.29 |
+| Load Testing | Locust | 2.24.0 |
+| Container | Docker Compose | - |
 
 ---
 
 ## 👤 Author
 
 **Abhishek Kumar Ojha**
-B.S.-M.S. (5YR) | IIT Kharagpur | 22CY23003
+B.S.-M.S. (5YR) Chemistry | IIT Kharagpur | 22CY23003
 
 [![GitHub](https://img.shields.io/badge/GitHub-ako--009-black?style=flat-square&logo=github)](https://github.com/ako-009)
+
